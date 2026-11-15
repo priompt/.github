@@ -1,0 +1,77 @@
+# Reusable: flags pull requests that skip the claim process in CONTRIBUTING.md.
+# Each repository calls it from a small pull_request_target workflow. It only
+# reads PR/issue metadata through the API and never checks out PR code, so it
+# is safe to run with a write token on pull requests from forks. It comments;
+# it never closes anything.
+name: claim-check
+
+on:
+  workflow_call:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const MAINTAINERS = ['sujal-maheshwari2004', 'iamDyeus', 'guptadevik2003'];
+            const MARKER = '<!-- claim-check -->';
+            const CONTRIBUTING = 'https://github.com/priompt/.github/blob/main/CONTRIBUTING.md';
+            const pr = context.payload.pull_request;
+            const author = pr.user.login;
+            const { owner, repo } = context.repo;
+            if (MAINTAINERS.includes(author) || pr.user.type === 'Bot') return;
+
+            const q = await github.graphql(`query($owner:String!,$repo:String!,$n:Int!){
+              repository(owner:$owner,name:$repo){ pullRequest(number:$n){
+                closingIssuesReferences(first:10){ nodes{ number
+                  assignees(first:10){ nodes{ login } }
+                  labels(first:20){ nodes{ name } } } } } } }`,
+              { owner, repo, n: pr.number });
+            const issues = q.repository.pullRequest.closingIssuesReferences.nodes;
+
+            const problems = [];
+            if (issues.length === 0) {
+              problems.push('It does not reference an issue. Add `Fixes #<issue>` for an issue that is assigned to you.');
+            }
+            for (const i of issues) {
+              if (!i.assignees.nodes.some(a => a.login === author)) {
+                problems.push(`Issue #${i.number} is not assigned to you. Comment on it to claim it and wait for a maintainer to assign it.`);
+              }
+            }
+            const open = await github.rest.search.issuesAndPullRequests({
+              q: `org:priompt is:pr is:open author:${author}`, per_page: 1 });
+            if (open.data.total_count > 2) {
+              problems.push(`You have ${open.data.total_count} open pull requests in the organisation; the limit is 2.`);
+            }
+            const gfi = issues.filter(i => i.labels.nodes.some(l => l.name === 'good first issue'));
+            if (gfi.length) {
+              const merged = await github.rest.search.issuesAndPullRequests({
+                q: `org:priompt is:pr is:merged author:${author}`, per_page: 1 });
+              if (merged.data.total_count > 0) {
+                problems.push(`#${gfi.map(i => i.number).join(', #')} is a good first issue, kept for people making their first contributions. You already have merged pull requests here, so please pick a \`help wanted\` issue.`);
+              }
+            }
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner, repo, issue_number: pr.number, per_page: 100 });
+            const mine = comments.find(c => c.body.includes(MARKER));
+            if (problems.length === 0) {
+              if (mine) {
+                await github.rest.issues.updateComment({ owner, repo, comment_id: mine.id,
+                  body: `${MARKER}\nThanks, this pull request now follows the [contribution process](${CONTRIBUTING}).` });
+              }
+              return;
+            }
+            const body = `${MARKER}\nThanks for the pull request, @${author}! Before a maintainer reviews it, please check the [contribution process](${CONTRIBUTING}):\n\n` +
+              problems.map(p => `- ${p}`).join('\n') +
+              `\n\nPull requests that do not follow the process may be closed.`;
+            if (mine) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: mine.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number: pr.number, body });
+            }
